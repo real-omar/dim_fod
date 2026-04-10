@@ -1,9 +1,9 @@
 package com.mrx7014.s25ultraspoofer;
 
-import android.os.SystemProperties;
 import android.text.TextUtils;
 import android.util.Log;
 
+import java.lang.reflect.Method;
 import java.util.Arrays;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -24,15 +24,15 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
  *  3. com.android.server.biometrics.sensors.fingerprint.aidl.FingerprintProvider
  *       – forces sensorType = TYPE_UDFPS_OPTICAL and halHandlesDisplayTouches = true
  */
-public class OplusUdfpsFix implements IXposedHookLoadPackage {
+public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "PHH-OplusUdfpsFix";
 
     // -----------------------------------------------------------------------
     // Package / class constants
     // -----------------------------------------------------------------------
-    private static final String PKG_SYSTEMUI  = "com.android.systemui";
-    private static final String PKG_SYSTEM    = "android"; // system_server runs as "android"
+    private static final String PKG_SYSTEMUI = "com.android.systemui";
+    private static final String PKG_SYSTEM   = "android"; // system_server
 
     private static final String CLS_AUTH_CONTROLLER =
             "com.android.systemui.biometrics.AuthController";
@@ -49,6 +49,40 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
 
     /** android.hardware.fingerprint.FingerprintSensorProperties.TYPE_UDFPS_OPTICAL = 3 */
     private static final int TYPE_UDFPS_OPTICAL = 3;
+
+    // -----------------------------------------------------------------------
+    // SystemProperties helpers (hidden API – accessed via reflection)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Equivalent to android.os.SystemProperties.get(key, def)
+     * Called at runtime inside hooks, so the hidden class is already loaded.
+     */
+    private static String sysPropGet(String key, String def) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method get = sp.getMethod("get", String.class, String.class);
+            return (String) get.invoke(null, key, def);
+        } catch (Throwable t) {
+            Log.e(TAG, "SystemProperties.get failed for key=" + key, t);
+            return def;
+        }
+    }
+
+    /**
+     * Equivalent to android.os.SystemProperties.set(key, value)
+     * Works because the hook runs inside SystemUI / system_server process
+     * which already holds the required permission.
+     */
+    private static void sysPropSet(String key, String value) {
+        try {
+            Class<?> sp = Class.forName("android.os.SystemProperties");
+            Method set = sp.getMethod("set", String.class, String.class);
+            set.invoke(null, key, value);
+        } catch (Throwable t) {
+            Log.e(TAG, "SystemProperties.set failed key=" + key + " val=" + value, t);
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Entry point
@@ -70,58 +104,27 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
     // 1. AuthController – set sys.phh.oplus.fppress on finger up / down
     // -----------------------------------------------------------------------
     private void hookAuthController(ClassLoader cl) {
-        /*
-         * The patch adds calls to oplusFpUiReady() inside the anonymous
-         * UdfpsController.Callback that AuthController registers.
-         * Because the anonymous class is compiled into AuthController, we hook
-         * the two callback methods directly on whatever class implements
-         * UdfpsController$Callback and is instantiated by AuthController.
-         *
-         * Strategy: hook the concrete anonymous class that AuthController
-         * creates. The easiest reliable approach is to hook the interface
-         * methods on AuthController itself when it is used as the callback
-         * implementor, OR to find the anonymous inner class.
-         *
-         * On AOSP the anonymous class is AuthController$3 (numbering varies).
-         * We take a robust approach: iterate candidate inner classes, or
-         * alternatively hook via the known method signatures on the outer class.
-         *
-         * Simplest & most compatible: Hook the two interface methods declared
-         * in the anonymous class by scanning $1..$9 inner classes.
-         */
+        // The anonymous UdfpsController.Callback is compiled as AuthController$N.
+        // Scan $1..$10 for the one that declares both onFingerUp and onFingerDown.
         boolean hooked = false;
         for (int i = 1; i <= 10; i++) {
             try {
-                Class<?> candidateCls = XposedHelpers.findClass(
+                Class<?> candidate = XposedHelpers.findClass(
                         CLS_AUTH_CONTROLLER + "$" + i, cl);
-
-                // Check it implements UdfpsController.Callback by looking for
-                // onFingerUp and onFingerDown methods
-                candidateCls.getDeclaredMethod("onFingerUp");
-                candidateCls.getDeclaredMethod("onFingerDown");
-
-                hookUdfpsCallbackClass(candidateCls);
+                candidate.getDeclaredMethod("onFingerUp");
+                candidate.getDeclaredMethod("onFingerDown");
+                hookUdfpsCallbackClass(candidate);
                 hooked = true;
-                Log.i(TAG, "Hooked UdfpsController.Callback impl: "
-                        + candidateCls.getName());
+                Log.i(TAG, "Hooked UdfpsController.Callback impl: " + candidate.getName());
                 break;
             } catch (NoSuchMethodException | ClassNotFoundException ignored) {
-                // not this one
+                // not this inner class
             }
         }
 
         if (!hooked) {
-            Log.w(TAG, "Could not find AuthController inner class implementing "
-                    + "UdfpsController.Callback – falling back to interface hook");
-            // Fallback: hook any class that has both methods via XposedBridge
-            try {
-                Class<?> callbackIface = XposedHelpers.findClass(CLS_UDFPS_CALLBACK, cl);
-                // XposedBridge can hook interface default methods or we warn the user
-                Log.w(TAG, "Interface-level hook not directly supported; "
-                        + "AuthController sysprop hook may be inactive.");
-            } catch (Throwable t) {
-                Log.e(TAG, "Fallback also failed", t);
-            }
+            Log.w(TAG, "Could not locate AuthController inner UdfpsController.Callback – "
+                    + "sys.phh.oplus.fppress hook inactive.");
         }
     }
 
@@ -131,7 +134,7 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    SystemProperties.set("sys.phh.oplus.fppress", "1");
+                    sysPropSet("sys.phh.oplus.fppress", "1");
                     Log.d(TAG, "onFingerDown: set sys.phh.oplus.fppress=1");
                 } catch (Throwable t) {
                     Log.e(TAG, "onFingerDown hook error", t);
@@ -144,7 +147,7 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
             @Override
             protected void beforeHookedMethod(MethodHookParam param) {
                 try {
-                    SystemProperties.set("sys.phh.oplus.fppress", "0");
+                    sysPropSet("sys.phh.oplus.fppress", "0");
                     Log.d(TAG, "onFingerUp: set sys.phh.oplus.fppress=0");
                 } catch (Throwable t) {
                     Log.e(TAG, "onFingerUp hook error", t);
@@ -157,15 +160,6 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
     // 2. AuthService – inject Oplus UDFPS sensor location into getUdfpsProps()
     // -----------------------------------------------------------------------
     private void hookAuthService(ClassLoader cl) {
-        /*
-         * The patch inserts an early-return block inside getUdfpsProps() that
-         * reads persist.vendor.fingerprint.optical.sensorlocation (format
-         * "x::y") and persist.vendor.fingerprint.optical.iconsize, and returns
-         * int[]{x, y, iconSize/2} before the existing generic logic runs.
-         *
-         * We replicate this by hooking the method and returning early when
-         * those props are present.
-         */
         try {
             Class<?> authServiceCls = XposedHelpers.findClass(CLS_AUTH_SERVICE, cl);
 
@@ -174,7 +168,7 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
-                                String fpLocation = SystemProperties.get(
+                                String fpLocation = sysPropGet(
                                         "persist.vendor.fingerprint.optical.sensorlocation", "");
 
                                 if (!TextUtils.isEmpty(fpLocation)
@@ -186,7 +180,7 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
                                     int x = Integer.parseInt(coords[0].trim());
                                     int y = Integer.parseInt(coords[1].trim());
 
-                                    String iconSizeStr = SystemProperties.get(
+                                    String iconSizeStr = sysPropGet(
                                             "persist.vendor.fingerprint.optical.iconsize", "0");
                                     int radius = Integer.parseInt(iconSizeStr.trim()) / 2;
 
@@ -194,7 +188,7 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
                                     Log.d(TAG, "Oplus/OPPO UDFPS detected. Props: "
                                             + Arrays.toString(udfpsProps));
 
-                                    // Return our result, skipping the original method
+                                    // Short-circuit: return our result before original runs
                                     param.setResult(udfpsProps);
                                 }
                             } catch (Throwable t) {
@@ -213,33 +207,15 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
     // 3. FingerprintProvider – force TYPE_UDFPS_OPTICAL when location X > 0
     // -----------------------------------------------------------------------
     private void hookFingerprintProvider(ClassLoader cl) {
-        /*
-         * The patch runs just after the sensor location debug-log loop inside
-         * addSensor() (or equivalent). It checks:
-         *   prop.sensorLocations.length == 1 && prop.sensorLocations[0].sensorLocationX > 0
-         * and if true sets:
-         *   prop.sensorType = TYPE_UDFPS_OPTICAL (3)
-         *   prop.halHandlesDisplayTouches = true
-         *
-         * We hook the method that constructs the Sensor object and mutate the
-         * FingerprintSensorPropertiesInternal before it is consumed.
-         *
-         * The target method signature (AOSP android-14 / 15):
-         *   private void addSensor(int sensorId,
-         *       FingerprintSensorPropertiesInternal prop, ...)
-         *
-         * We use hookAllMethods to be version-agnostic.
-         */
         try {
-            Class<?> fpProviderCls =
-                    XposedHelpers.findClass(CLS_FP_PROVIDER, cl);
+            Class<?> fpProviderCls = XposedHelpers.findClass(CLS_FP_PROVIDER, cl);
 
             XposedBridge.hookAllMethods(fpProviderCls, "addSensor",
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
                             try {
-                                // Find the FingerprintSensorPropertiesInternal arg
+                                // Find the FingerprintSensorPropertiesInternal argument
                                 Object prop = null;
                                 for (Object arg : param.args) {
                                     if (arg != null && arg.getClass().getName()
@@ -251,8 +227,7 @@ public class OplusUdfpsFix implements IXposedHookLoadPackage {
                                 if (prop == null) return;
 
                                 Object[] sensorLocations = (Object[])
-                                        XposedHelpers.getObjectField(
-                                                prop, "sensorLocations");
+                                        XposedHelpers.getObjectField(prop, "sensorLocations");
 
                                 if (sensorLocations == null
                                         || sensorLocations.length != 1) return;
