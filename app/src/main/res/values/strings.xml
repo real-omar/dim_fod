@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">FIX FOD</string>
-    <string name="module_description">Fix Fod on oplus devices by triggering oppo_notify_fppress on touch actions</string>
+    <string name="module_description">Fix Fod on oplus devices by triggering oppo_notify_fppress on touch actions  patch by: https://github.com/n-bilinskyi</string>
 </resources>
