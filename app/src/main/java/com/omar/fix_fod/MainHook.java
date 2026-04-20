@@ -3,40 +3,21 @@ package com.omar.fix_fod;
 import android.text.TextUtils;
 import android.util.Log;
 
+import java.io.FileOutputStream;
+import java.io.OutputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/**
- * LSPosed module — Oplus/OPPO UDFPS fix.
- *
- * STATUS FROM LOGS:
- *   ✅ UdfpsController.onFingerDown/Up hooks fire (SystemUI)
- *   ✅ sys.phh.oplus.fppress → sysfs bridge works
- *   ✅ UdfpsControllerOverlay layer exists (SF side is ok)
- *   ❌ FingerprintCallback.sendUdfpsPointerDown/Up callback null
- *   ❌ UdfpsDisplayMode.onDisabled is null
- *   ❌ Zero system_server hook output → "android" NOT in module scope
- *
- * ROOT CAUSE: "android" (system_server) is not in xposed_scope.
- * None of the AuthService / FingerprintCallback / Fingerprint21 hooks
- * ever run. Fix: add "android" to your scope array in arrays.xml.
- *
- * This version also fixes UdfpsDisplayMode.onDisabled being null,
- * which is a SystemUI-side issue we CAN fix without system_server scope.
- *
- * REQUIRED xposed_scope entries:
- *   <item>com.android.systemui</item>
- *   <item>android</item>   ← THIS IS THE MISSING ONE
- */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "PHH-OplusUdfpsFix";
@@ -72,6 +53,159 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final int TYPE_UDFPS_OPTICAL = 3;
 
+    // Sysfs nodes, tried in order
+    private static final String[] SYSFS_NODES = {
+        "/sys/kernel/oplus_display/oplus_notify_fppress",
+        "/sys/kernel/oppo_display/oppo_notify_fppress",
+    };
+
+    // Cached active node path
+    private static volatile String sActiveSysfsNode = null;
+
+    // Whether we're running in system_server (root-equivalent, no su needed)
+    private static volatile boolean sIsSystemServer = false;
+
+    // Single-thread executor for async root writes from SystemUI
+    // (Runtime.exec su can block briefly — we don't want to stall the UI thread)
+    private static final ExecutorService sWriteExecutor =
+            Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "udfps-fppress-writer");
+                t.setDaemon(true);
+                return t;
+            });
+
+    // Persistent root shell stdin — opened once and reused to avoid
+    // the overhead of spawning a new `su` process on every finger event
+    private static volatile Process sRootShell = null;
+    private static volatile OutputStream sRootStdin = null;
+    private static final Object sRootShellLock = new Object();
+
+    // -----------------------------------------------------------------------
+    // Core: write "1" or "0" to the fppress sysfs node
+    //
+    // Strategy (in priority order):
+    //   1. system_server context → direct FileOutputStream (already root)
+    //   2. SystemUI context → persistent root shell via `su`
+    //   3. Fallback → sysprop bridge (slow ~50ms but always works)
+    // -----------------------------------------------------------------------
+    private static void setFpPress(boolean pressed) {
+        String value = pressed ? "1" : "0";
+
+        if (sIsSystemServer) {
+            // system_server runs as root — write directly, no su needed
+            if (writeDirectly(value)) return;
+        } else {
+            // SystemUI (priv_app) — write via persistent root shell
+            // Do it asynchronously to avoid blocking the touch event thread
+            final String v = value;
+            sWriteExecutor.execute(() -> {
+                if (!writeViaRootShell(v)) {
+                    // Root shell failed — fall back to sysprop
+                    sysPropSet("sys.phh.oplus.fppress", v);
+                    Log.w(TAG, "setFpPress(" + v + ") via sysprop fallback");
+                }
+            });
+            return;
+        }
+
+        // Fallback if direct write failed
+        sysPropSet("sys.phh.oplus.fppress", value);
+        Log.w(TAG, "setFpPress(" + value + ") via sysprop fallback");
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct FileOutputStream write (works from system_server / root context)
+    // -----------------------------------------------------------------------
+    private static boolean writeDirectly(String value) {
+        String node = resolveNode();
+        if (node == null) return false;
+        try (FileOutputStream fos = new FileOutputStream(node)) {
+            fos.write(value.getBytes());
+            fos.flush();
+            Log.d(TAG, "direct write: " + node + " = " + value);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "direct write failed: " + t.getMessage());
+            sActiveSysfsNode = null;
+            return false;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Persistent root shell write (for SystemUI / priv_app context)
+    //
+    // Opens `su` once and keeps the process alive, writing commands to its
+    // stdin. This avoids the ~5-10ms overhead of forking a new process for
+    // every finger event. The shell is re-spawned if it dies.
+    // -----------------------------------------------------------------------
+    private static boolean writeViaRootShell(String value) {
+        String node = resolveNode();
+        if (node == null) return false;
+
+        synchronized (sRootShellLock) {
+            // Spawn or re-spawn the root shell if needed
+            if (sRootShell == null || !isShellAlive()) {
+                try {
+                    sRootShell = Runtime.getRuntime().exec("su");
+                    sRootStdin = sRootShell.getOutputStream();
+                    Log.i(TAG, "Root shell opened");
+                } catch (Throwable t) {
+                    Log.e(TAG, "Failed to open root shell: " + t.getMessage());
+                    sRootShell = null;
+                    sRootStdin = null;
+                    return false;
+                }
+            }
+
+            // Write the echo command to the shell's stdin
+            try {
+                String cmd = "echo " + value + " > " + node + "\n";
+                sRootStdin.write(cmd.getBytes());
+                sRootStdin.flush();
+                Log.d(TAG, "root shell write: " + node + " = " + value);
+                return true;
+            } catch (Throwable t) {
+                Log.w(TAG, "root shell write failed: " + t.getMessage());
+                // Shell died — close and let it be re-spawned next time
+                closeRootShell();
+                return false;
+            }
+        }
+    }
+
+    private static boolean isShellAlive() {
+        if (sRootShell == null) return false;
+        try {
+            sRootShell.exitValue();
+            return false; // exitValue() succeeds only if process has terminated
+        } catch (IllegalThreadStateException e) {
+            return true; // still running
+        }
+    }
+
+    private static void closeRootShell() {
+        try { if (sRootStdin != null) sRootStdin.close(); } catch (Throwable ignored) {}
+        try { if (sRootShell != null) sRootShell.destroy(); } catch (Throwable ignored) {}
+        sRootShell = null;
+        sRootStdin = null;
+    }
+
+    // -----------------------------------------------------------------------
+    // Resolve which sysfs node exists on this device
+    // -----------------------------------------------------------------------
+    private static String resolveNode() {
+        if (sActiveSysfsNode != null) return sActiveSysfsNode;
+        for (String node : SYSFS_NODES) {
+            if (new java.io.File(node).exists()) {
+                sActiveSysfsNode = node;
+                Log.i(TAG, "Resolved sysfs node: " + node);
+                return node;
+            }
+        }
+        Log.w(TAG, "No fppress sysfs node found");
+        return null;
+    }
+
     // -----------------------------------------------------------------------
     // SystemProperties via reflection
     // -----------------------------------------------------------------------
@@ -96,20 +230,17 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // Entry point — log EVERY package we're called for so we can verify scope
+    // Entry point
     // -----------------------------------------------------------------------
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Log every single package load so we can confirm scope in logcat.
-        // Look for "PHH-OplusUdfpsFix: loaded into: android" to confirm
-        // system_server is in scope. If you never see it, add "android" to
-        // your xposed_scope array in res/values/arrays.xml.
         Log.i(TAG, "loaded into: " + lpparam.packageName);
 
         if (PKG_SYSTEMUI.equals(lpparam.packageName)) {
             hookUdfpsController(lpparam.classLoader);
             hookUdfpsDisplayMode(lpparam.classLoader);
         } else if (PKG_SYSTEM.equals(lpparam.packageName)) {
+            sIsSystemServer = true;
             Log.i(TAG, ">>> system_server scope confirmed <<<");
             hookAuthService(lpparam.classLoader);
             hookFingerprintCallback(lpparam.classLoader);
@@ -120,21 +251,20 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // SystemUI: UdfpsController finger events → sys.phh.oplus.fppress
-    // Already confirmed working. Kept unchanged.
+    // SystemUI: UdfpsController → setFpPress
     // -----------------------------------------------------------------------
     private void hookUdfpsController(ClassLoader cl) {
         try {
             Class<?> cls = XposedHelpers.findClass(CLS_UDFPS_CONTROLLER, cl);
             XposedBridge.hookAllMethods(cls, "onFingerDown", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    sysPropSet("sys.phh.oplus.fppress", "1");
+                    setFpPress(true);
                     Log.d(TAG, "UdfpsController.onFingerDown → fppress=1");
                 }
             });
             XposedBridge.hookAllMethods(cls, "onFingerUp", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    sysPropSet("sys.phh.oplus.fppress", "0");
+                    setFpPress(false);
                     Log.d(TAG, "UdfpsController.onFingerUp → fppress=0");
                 }
             });
@@ -144,12 +274,12 @@ public class MainHook implements IXposedHookLoadPackage {
                 Class<?> cls = XposedHelpers.findClass(CLS_AUTH_CONTROLLER, cl);
                 XposedBridge.hookAllMethods(cls, "onUdfpsPointerDown", new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        sysPropSet("sys.phh.oplus.fppress", "1");
+                        setFpPress(true);
                     }
                 });
                 XposedBridge.hookAllMethods(cls, "onUdfpsPointerUp", new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        sysPropSet("sys.phh.oplus.fppress", "0");
+                        setFpPress(false);
                     }
                 });
                 Log.i(TAG, "Hooked AuthController (fallback)");
@@ -161,45 +291,25 @@ public class MainHook implements IXposedHookLoadPackage {
 
     // -----------------------------------------------------------------------
     // SystemUI: UdfpsDisplayMode
-    //
-    // Log shows: "UdfpsDisplayMode: disable | onDisabled is null"
-    // UdfpsDisplayMode manages the display brightness/refresh during UDFPS.
-    // onDisabled being null means the callback was never registered, likely
-    // because the HIDL HAL path skips registering it.
-    //
-    // We hook enable() and disable() to log what's happening and ensure
-    // the display mode changes actually complete even with a null callback.
     // -----------------------------------------------------------------------
     private void hookUdfpsDisplayMode(ClassLoader cl) {
         try {
             Class<?> cls = XposedHelpers.findClass(CLS_UDFPS_DISPLAY_MODE, cl);
-
-            // Hook disable() — the null onDisabled means the mode is never
-            // properly torn down, which can leave the display in a wrong state.
             XposedBridge.hookAllMethods(cls, "disable", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    Log.d(TAG, "UdfpsDisplayMode.disable() called");
-                    // Check if onDisabled callback is null and log the field
-                    try {
-                        dumpObjectFields(param.thisObject, "UdfpsDisplayMode");
-                    } catch (Throwable ignored) {}
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    Log.d(TAG, "UdfpsDisplayMode.disable()");
                 }
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    // If onDisabled was null, manually try to reset display state
-                    // by finding and calling any available reset/restore method
                     try {
-                        Object onDisabled = null;
                         for (Field f : param.thisObject.getClass().getDeclaredFields()) {
                             if (f.getName().contains("onDisabled")
                                     || f.getName().contains("mOnDisabled")
                                     || f.getName().contains("callback")) {
                                 f.setAccessible(true);
-                                onDisabled = f.get(param.thisObject);
-                                Log.i(TAG, "UdfpsDisplayMode field " + f.getName()
-                                        + " = " + (onDisabled == null ? "NULL" : onDisabled));
-                                break;
+                                Object val = f.get(param.thisObject);
+                                Log.i(TAG, "UdfpsDisplayMode." + f.getName()
+                                        + " = " + (val == null ? "NULL" : val));
                             }
                         }
                     } catch (Throwable t) {
@@ -207,15 +317,11 @@ public class MainHook implements IXposedHookLoadPackage {
                     }
                 }
             });
-
-            // Hook enable() for symmetry
             XposedBridge.hookAllMethods(cls, "enable", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    Log.d(TAG, "UdfpsDisplayMode.enable() called");
+                @Override protected void beforeHookedMethod(MethodHookParam param) {
+                    Log.d(TAG, "UdfpsDisplayMode.enable()");
                 }
             });
-
             Log.i(TAG, "Hooked UdfpsDisplayMode");
         } catch (XposedHelpers.ClassNotFoundError e) {
             Log.w(TAG, "UdfpsDisplayMode not found");
@@ -223,7 +329,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // system_server: AuthService.getUdfpsProps()
+    // system_server: AuthService
     // -----------------------------------------------------------------------
     private void hookAuthService(ClassLoader cl) {
         try {
@@ -240,9 +346,8 @@ public class MainHook implements IXposedHookLoadPackage {
                                 if (c.length < 2) return;
                                 int x = Integer.parseInt(c[0].trim());
                                 int y = Integer.parseInt(c[1].trim());
-                                String sz = sysPropGet(
-                                        "persist.vendor.fingerprint.optical.iconsize", "0");
-                                int r = Integer.parseInt(sz.trim()) / 2;
+                                int r = Integer.parseInt(sysPropGet(
+                                        "persist.vendor.fingerprint.optical.iconsize", "0").trim()) / 2;
                                 int[] props = {x, y, r};
                                 Log.i(TAG, "AuthService.getUdfpsProps → " + Arrays.toString(props));
                                 param.setResult(props);
@@ -258,13 +363,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // system_server: FingerprintCallback — HIDL path null callback fix
-    //
-    // "FingerprintCallback: sendUdfpsPointerDown, callback null"
-    // The callback (IUdfpsOverlayController) is only stored when
-    // halHandlesDisplayTouches == true at service init time.
-    // We hook the constructor to dump fields (once system_server is in scope)
-    // and force the sensor props.
+    // system_server: FingerprintCallback
     // -----------------------------------------------------------------------
     private void hookFingerprintCallback(ClassLoader cl) {
         try {
@@ -280,24 +379,21 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
 
-            // Hook sendUdfpsPointerDown/Up to suppress the null crash
-            // and attempt to invoke the callback via reflection
             for (String method : new String[]{"sendUdfpsPointerDown", "sendUdfpsPointerUp"}) {
                 final boolean isDown = method.equals("sendUdfpsPointerDown");
                 XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
-                        Log.i(TAG, "FingerprintCallback." + method + " called");
+                        Log.i(TAG, "FingerprintCallback." + method);
                         tryForwardUdfpsCallback(param.thisObject, isDown);
                     }
                 });
             }
 
-            // Hook all setters to catch when/if the callback ever gets registered
             for (Method m : cls.getDeclaredMethods()) {
                 String n = m.getName();
-                if (n.startsWith("set") || n.contains("Udfps") || n.contains("Callback")
-                        || n.contains("Controller")) {
+                if (n.startsWith("set") || n.contains("Udfps")
+                        || n.contains("Callback") || n.contains("Controller")) {
                     try {
                         XposedBridge.hookMethod(m, new XC_MethodHook() {
                             @Override
@@ -309,7 +405,6 @@ public class MainHook implements IXposedHookLoadPackage {
                     } catch (Throwable ignored) {}
                 }
             }
-
             Log.i(TAG, "Hooked FingerprintCallback");
         } catch (XposedHelpers.ClassNotFoundError e) {
             Log.e(TAG, "FingerprintCallback not found");
@@ -317,14 +412,13 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // system_server: Fingerprint21 — HIDL sensor props
+    // system_server: Fingerprint21
     // -----------------------------------------------------------------------
     private void hookFingerprint21(ClassLoader cl) {
         for (String clsName : new String[]{CLS_FINGERPRINT21, CLS_FINGERPRINT21_UDFPS}) {
             try {
                 Class<?> cls = XposedHelpers.findClass(clsName, cl);
                 Log.i(TAG, "Found " + clsName);
-
                 for (String method : new String[]{
                         "getSensorProps", "getSensorProperties", "buildSensorProperties",
                         "getSensorPropertiesInternal", "createAndRegisterService",
@@ -333,24 +427,21 @@ public class MainHook implements IXposedHookLoadPackage {
                         XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
                             @Override
                             protected void beforeHookedMethod(MethodHookParam param) {
-                                for (Object arg : param.args) {
+                                for (Object arg : param.args)
                                     if (arg != null && arg.getClass().getName()
-                                            .equals(CLS_FP_SENSOR_PROPS)) {
-                                        forceSensorTypeUdfps(arg, clsName + "." + method + " arg");
-                                    }
-                                }
+                                            .equals(CLS_FP_SENSOR_PROPS))
+                                        forceSensorTypeUdfps(arg, clsName + "." + method);
                             }
                             @Override
                             protected void afterHookedMethod(MethodHookParam param) {
                                 Object r = param.getResult();
                                 if (r != null && r.getClass().getName().equals(CLS_FP_SENSOR_PROPS))
-                                    forceSensorTypeUdfps(r, clsName + "." + method + " return");
+                                    forceSensorTypeUdfps(r, clsName + "." + method + " ret");
                                 forceSensorPropsOnObject(param.thisObject, clsName + "." + method);
                             }
                         });
                     } catch (Throwable ignored) {}
                 }
-
                 XposedBridge.hookAllConstructors(cls, new XC_MethodHook() {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
@@ -359,7 +450,6 @@ public class MainHook implements IXposedHookLoadPackage {
                         forceSensorPropsOnObject(param.thisObject, clsName + " ctor");
                     }
                 });
-
             } catch (XposedHelpers.ClassNotFoundError e) {
                 Log.d(TAG, clsName + " not found");
             }
@@ -367,7 +457,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // system_server: FingerprintProvider — AIDL path
+    // system_server: FingerprintProvider (AIDL)
     // -----------------------------------------------------------------------
     private void hookFingerprintProviderAidl(ClassLoader cl) {
         try {
@@ -375,10 +465,9 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(cls, "addSensor", new XC_MethodHook() {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
-                    for (Object arg : param.args) {
+                    for (Object arg : param.args)
                         if (arg != null && arg.getClass().getName().equals(CLS_FP_SENSOR_PROPS))
                             forceSensorTypeUdfps(arg, "FingerprintProvider.addSensor");
-                    }
                 }
             });
             Log.i(TAG, "Hooked FingerprintProvider#addSensor");
@@ -388,7 +477,7 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // system_server: HidlToAidlSessionAdapter — suppress onUiReady exception
+    // system_server: HidlToAidlSessionAdapter
     // -----------------------------------------------------------------------
     private void hookHidlToAidlAdapter(ClassLoader cl) {
         try {
@@ -409,7 +498,6 @@ public class MainHook implements IXposedHookLoadPackage {
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
-
     private void dumpObjectFields(Object obj, String label) {
         if (obj == null) return;
         Class<?> cls = obj.getClass();
@@ -421,13 +509,12 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (name.contains("callback") || name.contains("udfps")
                             || name.contains("sensor") || name.contains("display")
                             || name.contains("type") || name.contains("hal")
-                            || name.contains("controller") || name.contains("hidl")
-                            || name.contains("touch") || name.contains("overlay")) {
+                            || name.contains("controller") || name.contains("touch")
+                            || name.contains("overlay")) {
                         Object val = f.get(obj);
-                        Log.i(TAG, label + " field [" + f.getName() + ":"
+                        Log.i(TAG, label + " [" + f.getName() + ":"
                                 + f.getType().getSimpleName() + "] = "
-                                + (val == null ? "NULL" : val.getClass().getName()
-                                        + "@" + Integer.toHexString(System.identityHashCode(val))));
+                                + (val == null ? "NULL" : val.getClass().getName()));
                     }
                 } catch (Throwable ignored) {}
             }
@@ -463,15 +550,10 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedHelpers.setBooleanField(prop, "halHandlesDisplayTouches", true);
             Log.i(TAG, source + ": forced TYPE_UDFPS_OPTICAL (x=" + x + ")");
         } catch (Throwable t) {
-            Log.e(TAG, "forceSensorTypeUdfps from " + source + ": " + t.getMessage());
+            Log.e(TAG, "forceSensorTypeUdfps [" + source + "]: " + t.getMessage());
         }
     }
 
-    /**
-     * When sendUdfpsPointerDown/Up finds a null callback, scan all fields
-     * for any non-null interface that could serve as the UDFPS overlay controller
-     * and try to invoke it directly.
-     */
     private void tryForwardUdfpsCallback(Object fpCallback, boolean isDown) {
         if (fpCallback == null) return;
         Class<?> cls = fpCallback.getClass();
@@ -480,22 +562,23 @@ public class MainHook implements IXposedHookLoadPackage {
                 try {
                     f.setAccessible(true);
                     Object val = f.get(fpCallback);
-                    String typeName = f.getType().getName();
-                    Log.i(TAG, "FingerprintCallback field [" + f.getName() + ":"
+                    Log.i(TAG, "FingerprintCallback [" + f.getName() + ":"
                             + f.getType().getSimpleName() + "] = "
                             + (val == null ? "NULL" : val.getClass().getName()));
-                    if (val != null && (typeName.contains("Udfps") || typeName.contains("Overlay")
-                            || typeName.contains("Callback") || typeName.contains("Controller"))) {
-                        String[] candidates = isDown
-                                ? new String[]{"onFingerDown", "sendUdfpsPointerDown", "onPointerDown"}
-                                : new String[]{"onFingerUp",   "sendUdfpsPointerUp",   "onPointerUp"};
-                        for (String mn : candidates) {
-                            try {
-                                val.getClass().getMethod(mn).invoke(val);
-                                Log.i(TAG, "Forwarded " + (isDown ? "down" : "up")
-                                        + " to " + typeName + "." + mn);
-                                return;
-                            } catch (NoSuchMethodException ignored) {}
+                    if (val != null) {
+                        String tn = f.getType().getName();
+                        if (tn.contains("Udfps") || tn.contains("Overlay")
+                                || tn.contains("Callback") || tn.contains("Controller")) {
+                            for (String mn : isDown
+                                    ? new String[]{"onFingerDown", "sendUdfpsPointerDown", "onPointerDown"}
+                                    : new String[]{"onFingerUp",   "sendUdfpsPointerUp",   "onPointerUp"}) {
+                                try {
+                                    val.getClass().getMethod(mn).invoke(val);
+                                    Log.i(TAG, "Forwarded " + (isDown ? "down" : "up")
+                                            + " → " + tn + "." + mn);
+                                    return;
+                                } catch (NoSuchMethodException ignored) {}
+                            }
                         }
                     }
                 } catch (Throwable ignored) {}
