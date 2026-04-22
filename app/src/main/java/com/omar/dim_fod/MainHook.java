@@ -3,6 +3,7 @@ package com.omar.dim_fod;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.provider.Settings;
 import android.util.Log;
 import android.view.Gravity;
@@ -10,11 +11,11 @@ import android.view.View;
 import android.view.WindowManager;
 
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
+import java.util.HashMap;
+import java.util.WeakHashMap;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
-import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
@@ -33,29 +34,34 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final String TAG = "UdfpsMtkFix";
     private static final String SYSUI_PKG = "com.android.systemui";
 
-    // Class names we hook
     private static final String CLS_UDFPS_CONTROLLER =
             "com.android.systemui.biometrics.UdfpsController";
     private static final String CLS_UDFPS_OVERLAY =
             "com.android.systemui.biometrics.UdfpsControllerOverlay";
 
-    // The name HWC expects for the dim layer — must match config_udfpsHbmDimLayer
+    // The name MTK HWC expects for the dim layer
     private static final String HBM_DIM_LAYER_NAME = "OnScreenFingerprintDimLayer";
 
-    // -----------------------------------------------------------------------
-    // Per-overlay state — stored as tags on the overlay instance so we don't
-    // need a separate map (overlays are created/destroyed per auth session).
-    // -----------------------------------------------------------------------
-    private static final int TAG_HBM_VIEW    = 0x4d544b01; // "MTK\x01"
-    private static final int TAG_DIM_VIEW    = 0x4d544b02;
-    private static final int TAG_HBM_PARAMS  = 0x4d544b03;
-    private static final int TAG_DIM_PARAMS  = 0x4d544b04;
-    private static final int TAG_IS_ADDED    = 0x4d544b05; // Boolean
+    // Keys for per-overlay state map
+    private static final int TAG_HBM_VIEW   = 1;
+    private static final int TAG_DIM_VIEW   = 2;
+    private static final int TAG_HBM_PARAMS = 3;
+    private static final int TAG_DIM_PARAMS = 4;
+    private static final int TAG_IS_ADDED   = 5;
+
+    // WindowManager.LayoutParams values not in the public SDK — set via reflection
+    private static final int TYPE_NAVIGATION_BAR_PANEL         = 2024;
+    private static final int PRIVATE_FLAG_TRUSTED_OVERLAY       = 0x20000000;
+    private static final int INPUT_FEATURE_SPY                  = 0x00000004;
+    private static final int LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS = 3;
+
+    // Weak map to store per-overlay state without leaking
+    private static final WeakHashMap<Object, HashMap<Integer, Object>> sStateMap =
+            new WeakHashMap<>();
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         if (!SYSUI_PKG.equals(lpparam.packageName)) return;
-
         Log.i(TAG, "SystemUI loaded — installing MTK UDFPS dim layer hooks");
 
         hookOverlayShow(lpparam.classLoader);
@@ -67,37 +73,29 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // 1. UdfpsControllerOverlay — show()
-    //    Called when the overlay is first added to WindowManager.
-    //    We add hbmView + dimView here, then add the core view as usual.
+    // 1. UdfpsControllerOverlay.show() — add hbmView + dimView before core view
     // -----------------------------------------------------------------------
     private void hookOverlayShow(ClassLoader cl) {
-        // The method that calls windowManager.addView(view, coreLayoutParams...)
-        // In AOSP it's named "show" and takes a UdfpsAnimation parameter.
-        XposedHelpers.findAndHookMethod(
-                CLS_UDFPS_OVERLAY, cl,
-                "show",
-                // argument: UdfpsAnimation (we don't care about the type, just hook)
-                XposedHelpers.findClass(
-                        "com.android.systemui.biometrics.UdfpsAnimation", cl),
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        Object overlay = param.thisObject;
-                        Context ctx = getContext(overlay);
-                        if (ctx == null) return;
+        try {
+            Class<?> animClass = XposedHelpers.findClass(
+                    "com.android.systemui.biometrics.UdfpsAnimation", cl);
+            XposedHelpers.findAndHookMethod(CLS_UDFPS_OVERLAY, cl, "show", animClass,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            Object overlay = param.thisObject;
+                            Context ctx = getContext(overlay);
+                            if (ctx == null) return;
+                            WindowManager wm = getWindowManager(overlay);
+                            if (wm == null) return;
 
-                        WindowManager wm = getWindowManager(overlay);
-                        if (wm == null) return;
+                            if (getTag(overlay, TAG_HBM_VIEW) == null) {
+                                initViews(overlay, ctx);
+                            }
 
-                        // Create views and params if not already created
-                        if (getTag(overlay, TAG_HBM_VIEW) == null) {
-                            initViews(overlay, ctx, wm);
-                        }
+                            Boolean isAdded = (Boolean) getTag(overlay, TAG_IS_ADDED);
+                            if (isAdded != null && isAdded) return;
 
-                        // Add hbmView and dimView before the core overlay view
-                        Boolean isAdded = (Boolean) getTag(overlay, TAG_IS_ADDED);
-                        if (isAdded == null || !isAdded) {
                             WindowManager.LayoutParams hbmParams =
                                     (WindowManager.LayoutParams) getTag(overlay, TAG_HBM_PARAMS);
                             WindowManager.LayoutParams dimParams =
@@ -105,15 +103,14 @@ public class MainHook implements IXposedHookLoadPackage {
                             View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
                             View dimView = (View) getTag(overlay, TAG_DIM_VIEW);
 
-                            // Update dimensions to match the sensor bounds
                             Rect bounds = getSensorBounds(overlay);
-                            if (bounds != null && hbmParams != null && dimParams != null) {
+                            if (bounds != null && hbmParams != null) {
                                 hbmParams.width  = bounds.width();
                                 hbmParams.height = bounds.height();
                                 hbmParams.x      = bounds.left;
                                 hbmParams.y      = bounds.top;
-
-                                // dimView covers the full screen
+                            }
+                            if (dimParams != null) {
                                 dimParams.width  = WindowManager.LayoutParams.MATCH_PARENT;
                                 dimParams.height = WindowManager.LayoutParams.MATCH_PARENT;
                             }
@@ -129,182 +126,178 @@ public class MainHook implements IXposedHookLoadPackage {
                                 Log.e(TAG, "Failed to add HBM/Dim views", e);
                             }
                         }
-                    }
-                }
-        );
+                    });
+        } catch (Throwable t) {
+            Log.e(TAG, "hookOverlayShow failed: " + t.getMessage());
+        }
     }
 
     // -----------------------------------------------------------------------
-    // 2. UdfpsControllerOverlay — hide() / destroy()
-    //    Remove hbmView + dimView from WindowManager.
+    // 2. UdfpsControllerOverlay.hide() — remove hbmView + dimView
     // -----------------------------------------------------------------------
     private void hookOverlayHide(ClassLoader cl) {
-        XposedHelpers.findAndHookMethod(
-                CLS_UDFPS_OVERLAY, cl,
-                "hide",
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        Object overlay = param.thisObject;
-                        removeHbmViews(overlay);
-                    }
-                }
-        );
+        try {
+            XposedHelpers.findAndHookMethod(CLS_UDFPS_OVERLAY, cl, "hide",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            removeHbmViews(param.thisObject);
+                        }
+                    });
+        } catch (Throwable t) {
+            Log.e(TAG, "hookOverlayHide failed: " + t.getMessage());
+        }
     }
 
     // -----------------------------------------------------------------------
-    // 3. UdfpsControllerOverlay — updateLayout() / onConfigurationChanged()
-    //    Keep hbmView layout in sync when sensor bounds change.
+    // 3. UdfpsControllerOverlay.updateOverlayParams() — sync layout on change
     // -----------------------------------------------------------------------
     private void hookOverlayUpdateLayout(ClassLoader cl) {
-        // The method that calls windowManager.updateViewLayout(it, coreLayoutParams...)
-        // AOSP calls this "updateOverlayParams"
         try {
-            XposedHelpers.findAndHookMethod(
-                    CLS_UDFPS_OVERLAY, cl,
-                    "updateOverlayParams",
+            XposedHelpers.findAndHookMethod(CLS_UDFPS_OVERLAY, cl, "updateOverlayParams",
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
                             syncHbmLayout(param.thisObject);
                         }
-                    }
-            );
+                    });
         } catch (Throwable t) {
-            Log.w(TAG, "updateOverlayParams not found, trying onConfigChanged: " + t.getMessage());
+            Log.w(TAG, "updateOverlayParams not found (non-fatal): " + t.getMessage());
         }
     }
 
     // -----------------------------------------------------------------------
-    // 4. UdfpsController — onFingerDown()
-    //    Make hbmView visible, calculate brightness-based alpha, apply it.
+    // 4. UdfpsController.onFingerDown() — show hbmView, apply brightness alpha
     // -----------------------------------------------------------------------
     private void hookFingerDown(ClassLoader cl) {
-        XposedHelpers.findAndHookMethod(
-                CLS_UDFPS_CONTROLLER, cl,
-                "onFingerDown",
-                long.class,    // requestId
-                int.class,     // pointerId
-                float.class,   // x
-                float.class,   // y
-                float.class,   // minor
-                float.class,   // major
-                float.class,   // orientation
-                long.class,    // time
-                long.class,    // gestureStart
-                boolean.class, // isAod
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        Object controller = param.thisObject;
-                        Object overlay = getOverlay(controller);
-                        if (overlay == null) return;
+        try {
+            XposedHelpers.findAndHookMethod(
+                    CLS_UDFPS_CONTROLLER, cl, "onFingerDown",
+                    long.class,    // requestId
+                    int.class,     // pointerId
+                    float.class,   // x
+                    float.class,   // y
+                    float.class,   // minor
+                    float.class,   // major
+                    float.class,   // orientation
+                    long.class,    // time
+                    long.class,    // gestureStart
+                    boolean.class, // isAod
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            Object controller = param.thisObject;
+                            Object overlay = getOverlay(controller);
+                            if (overlay == null) return;
 
-                        View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
-                        WindowManager.LayoutParams hbmParams =
-                                (WindowManager.LayoutParams) getTag(overlay, TAG_HBM_PARAMS);
-                        if (hbmView == null || hbmParams == null) return;
+                            View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
+                            WindowManager.LayoutParams hbmParams =
+                                    (WindowManager.LayoutParams) getTag(overlay, TAG_HBM_PARAMS);
+                            if (hbmView == null || hbmParams == null) return;
 
-                        Context ctx = getContext(overlay);
-                        if (ctx == null) return;
+                            Context ctx = getContext(overlay);
+                            if (ctx == null) return;
 
-                        int brightness = getSystemBrightness(ctx);
-                        float alpha = calculateAlpha(brightness);
+                            int brightness = getSystemBrightness(ctx);
+                            float alpha = calculateAlpha(brightness);
+                            Log.d(TAG, "onFingerDown — brightness=" + brightness + " alpha=" + alpha);
 
-                        Log.d(TAG, "onFingerDown — brightness=" + brightness
-                                + " alpha=" + alpha);
+                            if (hbmView.getVisibility() != View.VISIBLE) {
+                                hbmView.setVisibility(View.VISIBLE);
+                            }
 
-                        if (hbmView.getVisibility() != View.VISIBLE) {
-                            hbmView.setVisibility(View.VISIBLE);
-                        }
-
-                        if (Math.abs(hbmParams.alpha - alpha) > 0.001f) {
-                            hbmParams.alpha = alpha;
-                            WindowManager wm = getWindowManager(overlay);
-                            if (wm != null) {
-                                try {
-                                    wm.updateViewLayout(hbmView, hbmParams);
-                                } catch (Exception e) {
-                                    Log.w(TAG, "updateViewLayout failed in onFingerDown", e);
+                            if (Math.abs(hbmParams.alpha - alpha) > 0.001f) {
+                                hbmParams.alpha = alpha;
+                                WindowManager wm = getWindowManager(overlay);
+                                if (wm != null) {
+                                    try {
+                                        wm.updateViewLayout(hbmView, hbmParams);
+                                    } catch (Exception e) {
+                                        Log.w(TAG, "updateViewLayout failed in onFingerDown", e);
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-        );
+                    });
+        } catch (Throwable t) {
+            Log.e(TAG, "hookFingerDown failed: " + t.getMessage());
+        }
     }
 
     // -----------------------------------------------------------------------
-    // 5. UdfpsController — onFingerUp()
-    //    Hide hbmView.
+    // 5. UdfpsController.onFingerUp() — hide hbmView
     // -----------------------------------------------------------------------
     private void hookFingerUp(ClassLoader cl) {
-        XposedHelpers.findAndHookMethod(
-                CLS_UDFPS_CONTROLLER, cl,
-                "onFingerUp",
-                long.class, // requestId
-                XposedHelpers.findClass(
-                        "com.android.systemui.biometrics.UdfpsTouchOverlay", cl),
-                new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        Object controller = param.thisObject;
-                        Object overlay = getOverlay(controller);
-                        if (overlay == null) return;
-
-                        View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
-                        if (hbmView != null) {
-                            hbmView.setVisibility(View.GONE);
-                            Log.d(TAG, "onFingerUp — hbmView hidden");
-                        }
-                    }
+        XC_MethodHook fingerUpHook = new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                Object controller = param.thisObject;
+                Object overlay = getOverlay(controller);
+                if (overlay == null) return;
+                View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
+                if (hbmView != null) {
+                    hbmView.setVisibility(View.GONE);
+                    Log.d(TAG, "onFingerUp — hbmView hidden");
                 }
-        );
+            }
+        };
+
+        // Try UdfpsTouchOverlay signature first, fall back to View
+        boolean hooked = false;
+        try {
+            Class<?> touchOverlayClass = XposedHelpers.findClass(
+                    "com.android.systemui.biometrics.UdfpsTouchOverlay", cl);
+            XposedHelpers.findAndHookMethod(
+                    CLS_UDFPS_CONTROLLER, cl, "onFingerUp",
+                    long.class, touchOverlayClass, fingerUpHook);
+            hooked = true;
+        } catch (Throwable ignored) {}
+
+        if (!hooked) {
+            try {
+                XposedHelpers.findAndHookMethod(
+                        CLS_UDFPS_CONTROLLER, cl, "onFingerUp",
+                        long.class, View.class, fingerUpHook);
+            } catch (Throwable t) {
+                Log.e(TAG, "hookFingerUp failed: " + t.getMessage());
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
-    // 6. UdfpsController — hideUdfpsOverlay()
-    //    Safety net: ensure hbmView is gone even if fingerUp wasn't called.
+    // 6. UdfpsController.hideUdfpsOverlay() — safety net
     // -----------------------------------------------------------------------
     private void hookHideUdfpsOverlay(ClassLoader cl) {
-        XposedHelpers.findAndHookMethod(
-                CLS_UDFPS_CONTROLLER, cl,
-                "hideUdfpsOverlay",
-                new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        Object controller = param.thisObject;
-                        Object overlay = getOverlay(controller);
-                        if (overlay == null) return;
-
-                        View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
-                        if (hbmView != null) {
-                            hbmView.setVisibility(View.GONE);
+        try {
+            XposedHelpers.findAndHookMethod(CLS_UDFPS_CONTROLLER, cl, "hideUdfpsOverlay",
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            Object overlay = getOverlay(param.thisObject);
+                            if (overlay == null) return;
+                            View hbmView = (View) getTag(overlay, TAG_HBM_VIEW);
+                            if (hbmView != null) hbmView.setVisibility(View.GONE);
                         }
-                    }
-                }
-        );
+                    });
+        } catch (Throwable t) {
+            Log.e(TAG, "hookHideUdfpsOverlay failed: " + t.getMessage());
+        }
     }
 
     // -----------------------------------------------------------------------
-    // Helpers — view / param creation
+    // View + params init
     // -----------------------------------------------------------------------
-
-    private void initViews(Object overlay, Context ctx, WindowManager wm) {
-        // hbmView: full-black layer, initially invisible
+    private void initViews(Object overlay, Context ctx) {
         View hbmView = new View(ctx);
         hbmView.setBackgroundColor(Color.BLACK);
         hbmView.setVisibility(View.INVISIBLE);
 
-        // dimView: transparent overlay that satisfies HWC layer expectations
         View dimView = new View(ctx);
         dimView.setBackgroundColor(Color.TRANSPARENT);
 
-        // hbmLayoutParams — named "OnScreenFingerprintDimLayer" for HWC
         WindowManager.LayoutParams hbmParams = buildLayerParams(HBM_DIM_LAYER_NAME);
         hbmParams.alpha = 0.1f;
 
-        // dimLayoutParams
         WindowManager.LayoutParams dimParams = buildLayerParams("UdfpsDim");
 
         setTag(overlay, TAG_HBM_VIEW,   hbmView);
@@ -316,11 +309,16 @@ public class MainHook implements IXposedHookLoadPackage {
         Log.d(TAG, "initViews: created hbmView + dimView");
     }
 
+    /**
+     * Builds WindowManager.LayoutParams for a trusted overlay layer.
+     * Hidden fields (title, privateFlags, fitInsetsTypes, etc.) are set via
+     * reflection since they are absent from the public SDK stubs.
+     */
     private WindowManager.LayoutParams buildLayerParams(String title) {
         WindowManager.LayoutParams lp = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.TYPE_NAVIGATION_BAR_PANEL,
+                TYPE_NAVIGATION_BAR_PANEL,
                 WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
                         | WindowManager.LayoutParams.FLAG_SPLIT_TOUCH
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
@@ -328,29 +326,31 @@ public class MainHook implements IXposedHookLoadPackage {
                         | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                 PixelFormat.TRANSLUCENT
         );
-        lp.title = title;
-        lp.gravity = Gravity.TOP | Gravity.LEFT;
-        lp.fitInsetsTypes = 0;
-        lp.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS;
-        lp.accessibilityTitle = " ";
 
-        // PRIVATE_FLAG_TRUSTED_OVERLAY — value 0x20000000, constant available API 31+
+        lp.gravity = Gravity.TOP | Gravity.LEFT;
+
+        // Hidden public/package-private fields — set reflectively
+        setFieldSafeString(lp, "title",              title);
+        setFieldSafeString(lp, "accessibilityTitle", " ");
+        setFieldSafeInt(lp, "fitInsetsTypes",           0);
+        setFieldSafeInt(lp, "layoutInDisplayCutoutMode", LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS);
+
+        // privateFlags |= PRIVATE_FLAG_TRUSTED_OVERLAY
         try {
-            int trustedOverlay = (int) WindowManager.LayoutParams.class
-                    .getField("PRIVATE_FLAG_TRUSTED_OVERLAY").get(null);
-            lp.privateFlags |= trustedOverlay;
+            Field pf = WindowManager.LayoutParams.class.getDeclaredField("privateFlags");
+            pf.setAccessible(true);
+            pf.setInt(lp, pf.getInt(lp) | PRIVATE_FLAG_TRUSTED_OVERLAY);
         } catch (Exception e) {
-            Log.w(TAG, "PRIVATE_FLAG_TRUSTED_OVERLAY not found: " + e.getMessage());
+            Log.w(TAG, "privateFlags not set: " + e.getMessage());
         }
 
-        // INPUT_FEATURE_SPY — value 0x00000004
+        // inputFeatures |= INPUT_FEATURE_SPY
         try {
-            int spyFlag = (int) WindowManager.LayoutParams.class
-                    .getField("INPUT_FEATURE_SPY").get(null);
-            lp.inputFeatures |= spyFlag;
+            Field inf = WindowManager.LayoutParams.class.getDeclaredField("inputFeatures");
+            inf.setAccessible(true);
+            inf.setInt(lp, inf.getInt(lp) | INPUT_FEATURE_SPY);
         } catch (Exception e) {
-            Log.w(TAG, "INPUT_FEATURE_SPY not found: " + e.getMessage());
+            Log.w(TAG, "inputFeatures not set: " + e.getMessage());
         }
 
         return lp;
@@ -410,55 +410,35 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // -----------------------------------------------------------------------
-    // MtkUdfpsScrimController logic — inlined (no separate class needed)
+    // MtkUdfpsScrimController logic (inlined)
     // -----------------------------------------------------------------------
-
-    /**
-     * Reads the current screen brightness.
-     * Tries screen_brightness_float first (0.0–1.0), falls back to SCREEN_BRIGHTNESS (0–255).
-     */
     private int getSystemBrightness(Context ctx) {
         try {
             float brightFloat = Settings.System.getFloat(
                     ctx.getContentResolver(), "screen_brightness_float", -1f);
-            if (brightFloat >= 0f) {
-                return (int) (brightFloat * 255f);
-            }
+            if (brightFloat >= 0f) return (int) (brightFloat * 255f);
         } catch (Exception ignored) {}
-
         try {
             return Settings.System.getInt(
-                    ctx.getContentResolver(),
-                    Settings.System.SCREEN_BRIGHTNESS, 127);
+                    ctx.getContentResolver(), Settings.System.SCREEN_BRIGHTNESS, 127);
         } catch (Exception e) {
             return 127;
         }
     }
 
-    /**
-     * Converts brightness (0–255) to a window alpha (0.0–1.0).
-     * Mirrors MtkUdfpsScrimController.calculateAlpha():
-     *   alpha = 1 - (brightness / 255)
-     *   if brightness < 25: apply extra 5% transparency (× 0.95)
-     */
     private float calculateAlpha(int brightness) {
         float alpha = 1.0f - (brightness / 255.0f);
-        if (brightness < 25) {
-            alpha = alpha * 0.95f;
-        }
+        if (brightness < 25) alpha *= 0.95f;
         return Math.max(0.0f, Math.min(1.0f, alpha));
     }
 
     // -----------------------------------------------------------------------
     // Reflection helpers
     // -----------------------------------------------------------------------
-
-    /** Get the Context from a UdfpsControllerOverlay instance. */
     private Context getContext(Object overlay) {
         try {
             return (Context) XposedHelpers.getObjectField(overlay, "context");
         } catch (Throwable t) {
-            // Kotlin "context" might be stored differently
             try {
                 Field f = overlay.getClass().getDeclaredField("mContext");
                 f.setAccessible(true);
@@ -470,41 +450,32 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    /** Get the WindowManager from a UdfpsControllerOverlay instance. */
     private WindowManager getWindowManager(Object overlay) {
         try {
             return (WindowManager) XposedHelpers.getObjectField(overlay, "windowManager");
         } catch (Throwable t) {
-            Log.w(TAG, "Could not get WindowManager from overlay: " + t.getMessage());
+            Log.w(TAG, "Could not get WindowManager: " + t.getMessage());
             return null;
         }
     }
 
-    /** Get the current overlay from a UdfpsController instance. */
     private Object getOverlay(Object controller) {
         try {
             return XposedHelpers.getObjectField(controller, "mOverlay");
         } catch (Throwable t) {
-            Log.w(TAG, "Could not get mOverlay from controller: " + t.getMessage());
+            Log.w(TAG, "Could not get mOverlay: " + t.getMessage());
             return null;
         }
     }
 
-    /**
-     * Get sensorBounds (Rect) from overlay — stored in UdfpsOverlayParams.
-     * Path: overlay.overlayParams.sensorBounds  (Kotlin property)
-     */
-    private android.graphics.Rect getSensorBounds(Object overlay) {
+    private Rect getSensorBounds(Object overlay) {
         try {
             Object overlayParams = XposedHelpers.getObjectField(overlay, "overlayParams");
             if (overlayParams == null) return null;
-            return (android.graphics.Rect) XposedHelpers.getObjectField(
-                    overlayParams, "sensorBounds");
+            return (Rect) XposedHelpers.getObjectField(overlayParams, "sensorBounds");
         } catch (Throwable t) {
-            // Fallback: try sensorRect directly
             try {
-                return (android.graphics.Rect) XposedHelpers.getObjectField(
-                        overlay, "sensorRect");
+                return (Rect) XposedHelpers.getObjectField(overlay, "sensorRect");
             } catch (Throwable t2) {
                 Log.w(TAG, "getSensorBounds failed: " + t2.getMessage());
                 return null;
@@ -512,32 +483,45 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Tag storage — uses View.setTag(int, Object) on a sentinel View to attach
-    // arbitrary state to the overlay instance without needing a WeakHashMap.
-    // We use the overlay object's identity hash as an anchor by keeping a
-    // simple per-overlay ViewGroup tag holder.
-    // -----------------------------------------------------------------------
-
-    /**
-     * We store our per-overlay state in a small Object[] attached directly to
-     * the overlay via reflection into a synthetic field we inject once.
-     * Simpler: use a static WeakHashMap keyed by overlay identity.
-     */
-    private static final java.util.WeakHashMap<Object, java.util.HashMap<Integer, Object>>
-            sStateMap = new java.util.WeakHashMap<>();
-
-    private void setTag(Object overlay, int key, Object value) {
-        java.util.HashMap<Integer, Object> map =
-                sStateMap.computeIfAbsent(overlay, k -> new java.util.HashMap<>());
-        map.put(key, value);
+    private void setFieldSafeString(Object obj, String fieldName, String value) {
+        try {
+            Field f = obj.getClass().getField(fieldName);
+            f.set(obj, value);
+        } catch (Exception e1) {
+            try {
+                Field f = obj.getClass().getDeclaredField(fieldName);
+                f.setAccessible(true);
+                f.set(obj, value);
+            } catch (Exception e2) {
+                Log.w(TAG, "setField(" + fieldName + ") failed: " + e2.getMessage());
+            }
+        }
     }
 
-    private Object getTag(Object overlay, int key) {
-        java.util.HashMap<Integer, Object> map = sStateMap.get(overlay);
+    private void setFieldSafeInt(Object obj, String fieldName, int value) {
+        try {
+            Field f = obj.getClass().getField(fieldName);
+            f.setInt(obj, value);
+        } catch (Exception e1) {
+            try {
+                Field f = obj.getClass().getDeclaredField(fieldName);
+                f.setAccessible(true);
+                f.setInt(obj, value);
+            } catch (Exception e2) {
+                Log.w(TAG, "setField(" + fieldName + ") failed: " + e2.getMessage());
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // State map (synchronized for thread safety)
+    // -----------------------------------------------------------------------
+    private synchronized void setTag(Object overlay, int key, Object value) {
+        sStateMap.computeIfAbsent(overlay, k -> new HashMap<>()).put(key, value);
+    }
+
+    private synchronized Object getTag(Object overlay, int key) {
+        HashMap<Integer, Object> map = sStateMap.get(overlay);
         return map != null ? map.get(key) : null;
     }
-
-    // Rect import shim (android.graphics.Rect is always available)
-    private static class Rect extends android.graphics.Rect {}
 }
