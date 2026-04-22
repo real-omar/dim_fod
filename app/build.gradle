@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'com.omar.fix_fod'
+    namespace 'com.omar.dim_fod'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.omar.fix_fod"
+        applicationId "com.omar.dim_fod"
         minSdk 29
         targetSdk 34
         versionCode 1
